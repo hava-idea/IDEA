@@ -1,0 +1,50 @@
+dataset:
+  name: rsscn7
+  root: /data/RSSCN7
+  train_ratio: 0.70
+  val_ratio: 0.15
+  seed: 42
+
+experiment:
+  shots: 20
+  token_budget: 4096
+  device: cuda:0
+  results_dir: ./results
+  log_every: 50
+
+model:
+  model_path: /weights/InternVL2_5-8B
+  torch_dtype: bfloat16
+  load_in_8bit: false
+
+pcma:
+  sigma_sq: 1.0
+  min_variance: 1.0e-6
+  shrinkage: 0.0
+
+sac:
+  temperature: 0.07
+  hard_negative_k: 5
+  use_hard_negatives: true
+
+calibration:
+  w_sem: 0.7
+  w_str: 0.3
+  weight_mode: amplitude
+  use_structural: true
+  standardise: true
+
+lsconv:
+  dim: 64
+
+selection:
+  alpha: 0.4
+  beta: 0.3
+  gamma: 0.2
+  delta: 0.3
+  omega1: 0.2
+  omega2: 0.15
+
+priors:
+  hard_class_threshold: 0.5
+  hard_negative_k: 5
