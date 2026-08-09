@@ -77,16 +77,6 @@ result = exp.evaluate(dataset)
 print(result.summary())
 ```
 
-## Running tests
-
-```bash
-pip install pytest
-pytest tests/ -v
-```
-
-Tests use synthetic random features and `MockBackend` — no GPU or dataset
-downloads are needed.
-
 ## Citation
 
 ```bibtex
