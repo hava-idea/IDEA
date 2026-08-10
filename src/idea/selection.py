@@ -1,16 +1,16 @@
-"""Budget-constrained adaptive decision engine (Section 3.3, Eq. 11-13).
+"""Budget-constrained adaptive decision engine from Section 3.3.
 
 This module assembles the final many-shot context. It sits on top of the
 Intrinsic Layer (PCMA typicality, SAC discriminativeness) and implements the
 Relational and Global layers:
 
-**Relational Layer (Eq. 11)** -- query-aware similarity folds intrinsic quality
+**Relational Layer** -- query-aware similarity folds intrinsic quality
 into query proximity, so a candidate scores well only when it is both close to
 the query *and* reliable as a demonstration::
 
     S_sim(e, q) = w1 * S_typ(e) + w2 * S_disc(e) + sim(z_e, z_q)
 
-**Global Layer (Eq. 12-13)** -- sequence-level terms control redundancy, label
+**Global Layer** -- sequence-level terms control redundancy, label
 skew and hard-class coverage, and an MMR-style loop picks exemplars one at a
 time::
 
@@ -59,7 +59,7 @@ class Candidate:
     label:
         Ground-truth class.
     embedding:
-        Calibrated representation ``z`` (Eq. 6), L2-normalised.
+        Calibrated representation ``z``, L2-normalised.
     text_token_cost:
         Tokens contributed by this exemplar's text, excluding image tokens.
     """
@@ -78,15 +78,15 @@ class Candidate:
 
 @dataclass
 class SelectionWeights:
-    """Decision weights for Eq. 11 and Eq. 13.
+    """Decision weights for relational and global selection scores.
 
     Attributes
     ----------
     alpha, beta, gamma, delta:
-        Priorities of similarity, balance, diversity and hardness in Eq. 13.
+        Priorities of similarity, balance, diversity and hardness.
     omega1, omega2:
         Intrinsic quality adjustment coefficients on typicality and
-        discriminativeness in Eq. 11.
+        discriminativeness in the relational score.
     """
 
     alpha: float = 0.4
@@ -105,6 +105,136 @@ class SelectionWeights:
             "omega1": self.omega1,
             "omega2": self.omega2,
         }
+
+
+@dataclass(frozen=True)
+class AdaptiveDiagnostics:
+    """Validation diagnostics used by the one-pass weight update."""
+
+    r_bal: float
+    r_div: float
+    r_hard: float
+    r_var: float
+    r_conf: float
+
+    def __post_init__(self) -> None:
+        for name, value in self.__dict__.items():
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {value}")
+
+
+def normalize_to_sum(values: np.ndarray, target_sum: float) -> np.ndarray:
+    """Scale non-negative values while preserving a requested total."""
+    values = np.asarray(values, dtype=np.float64)
+    total = float(values.sum())
+    if total <= 0:
+        raise ValueError("cannot normalize weights with a non-positive sum")
+    return values * target_sum / total
+
+
+def adapt_selection_weights(
+    base: SelectionWeights,
+    diagnostics: AdaptiveDiagnostics,
+) -> SelectionWeights:
+    """Apply the paper's one-pass multiplicative reliability update."""
+    global_base = np.array(
+        [base.alpha, base.beta, base.gamma, base.delta], dtype=np.float64
+    )
+    global_reliability = np.array(
+        [0.0, diagnostics.r_bal, diagnostics.r_div, diagnostics.r_hard]
+    )
+    global_new = normalize_to_sum(
+        global_base * (1.0 + global_reliability), global_base.sum()
+    )
+
+    intrinsic_base = np.array([base.omega1, base.omega2], dtype=np.float64)
+    intrinsic_new = normalize_to_sum(
+        intrinsic_base
+        * np.array([1.0 + diagnostics.r_var, 1.0 + diagnostics.r_conf]),
+        intrinsic_base.sum(),
+    )
+    return SelectionWeights(*map(float, [*global_new, *intrinsic_new]))
+
+
+def imbalance_diagnostic(labels: Sequence[str], n_classes: int) -> float:
+    """Return ``1 - H(p) / log(|C|)`` for context labels."""
+    if not labels or n_classes <= 1:
+        return 0.0
+    counts = np.asarray(list(Counter(labels).values()), dtype=np.float64)
+    probabilities = counts / counts.sum()
+    entropy = float(-(probabilities * np.log(probabilities)).sum())
+    return float(np.clip(1.0 - entropy / np.log(n_classes), 0.0, 1.0))
+
+
+def redundancy_diagnostic(embeddings: np.ndarray) -> float:
+    """Mean nearest-neighbor cosine redundancy mapped to ``[0, 1]``."""
+    embeddings = np.asarray(embeddings, dtype=np.float64)
+    if embeddings.ndim != 2 or len(embeddings) < 2:
+        return 0.0
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    normalized = embeddings / np.maximum(norms, 1e-8)
+    similarities = normalized @ normalized.T
+    np.fill_diagonal(similarities, -np.inf)
+    return float(np.clip(np.mean((1.0 + similarities.max(axis=1)) / 2.0), 0, 1))
+
+
+def compute_adaptive_diagnostics(
+    *,
+    context_labels: Sequence[Sequence[str]],
+    context_embeddings: Sequence[np.ndarray],
+    train_embeddings: np.ndarray,
+    train_labels: Sequence[str],
+    val_true: Sequence[str],
+    val_predictions: Sequence[Optional[str]],
+    hard_classes: Set[str],
+    n_classes: int,
+) -> AdaptiveDiagnostics:
+    """Compute the five validation diagnostics used for reweighting."""
+    r_bal_values = [imbalance_diagnostic(labels, n_classes) for labels in context_labels]
+    r_div_values = [redundancy_diagnostic(block) for block in context_embeddings]
+
+    hard_indices = [i for i, label in enumerate(val_true) if label in hard_classes]
+    r_hard = (
+        1.0
+        - np.mean([val_predictions[i] == val_true[i] for i in hard_indices])
+        if hard_indices
+        else 0.0
+    )
+
+    train_embeddings = np.asarray(train_embeddings, dtype=np.float64)
+    mean_variances = []
+    for label in sorted(set(train_labels)):
+        mask = np.asarray([item == label for item in train_labels])
+        block = train_embeddings[mask]
+        # Mean intra-class feature variance: (1 / D) * sum_d Var(z_d).
+        mean_variances.append(float(np.mean(np.var(block, axis=0))))
+
+    class_errors = []
+    for label in sorted(set(val_true)):
+        indices = [i for i, truth in enumerate(val_true) if truth == label]
+        class_errors.append(
+            float(
+                np.mean(
+                    [
+                        val_predictions[i] is not None
+                        and val_predictions[i] != label
+                        for i in indices
+                    ]
+                )
+            )
+        )
+
+    return AdaptiveDiagnostics(
+        r_bal=float(np.mean(r_bal_values)) if r_bal_values else 0.0,
+        r_div=float(np.mean(r_div_values)) if r_div_values else 0.0,
+        r_hard=float(r_hard),
+        r_var=(
+            float(np.clip(np.mean(mean_variances), 0, 1))
+            if mean_variances
+            else 0.0
+        ),
+        r_conf=float(np.mean(class_errors)) if class_errors else 0.0,
+    )
 
 
 @dataclass
@@ -130,9 +260,7 @@ class SelectionTrace:
         """Shannon entropy (nats) of the selected label distribution.
 
         A low value means the prompt is dominated by a few classes, which is the
-        failure mode ``S_bal`` exists to prevent. Worth logging: skewed contexts
-        are a known driver of negative transfer in many-shot ICL, because the
-        model reads the demonstration label frequencies as a class prior.
+        failure mode ``S_bal`` is designed to mitigate.
         """
         if not self.labels:
             return 0.0
@@ -213,7 +341,7 @@ class AdaptiveSelectionEngine:
             )
 
     def relational_similarity(self, query_embedding: np.ndarray) -> np.ndarray:
-        """Compute ``S_sim(e, q)`` for every candidate (Eq. 11).
+        """Compute relational similarity for every candidate.
 
         Parameters
         ----------
@@ -279,7 +407,7 @@ class AdaptiveSelectionEngine:
                 if candidate.id in exclude_ids:
                     available[index] = False
 
-        # Running max similarity to the selected set, for S_div (Eq. 12).
+        # Running max similarity to the selected set.
         # An empty selected set means no redundancy penalty, so S_div = 1.
         max_sim_to_selected = np.full(num_candidates, -1.0, dtype=np.float32)
         label_counts: Counter = Counter()
@@ -293,12 +421,12 @@ class AdaptiveSelectionEngine:
                 trace.stopped_on = "pool_exhausted"
                 break
 
-            # S_div: 1 - max similarity to anything already selected (Eq. 12).
+            # S_div: 1 - max similarity to anything already selected.
             diversity = 1.0 - max_sim_to_selected
             if not selected:
                 diversity = np.ones(num_candidates, dtype=np.float32)
 
-            # S_bal: inverse frequency of the candidate's label in S_t (Eq. 13).
+            # S_bal: inverse frequency of the candidate's label in S_t.
             balance = np.asarray(
                 [1.0 / (label_counts[label] + 1) for label in self._labels],
                 dtype=np.float32,

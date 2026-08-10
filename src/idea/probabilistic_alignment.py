@@ -16,16 +16,22 @@ kernel
 
     S_typ(e) = exp(-W2^2(z_e, N_c) / sigma^2)
 
-The trace term rescales the distance by the spread of the class
-manifold, so that classes with naturally diverse appearances are not
-penalised in the same way as compact classes.
+The two terms have different roles. Within a class, ``Tr(Sigma_c)`` is
+constant, so candidate ordering is determined by ``||z_e - mu_c||^2``. Across
+classes, the trace acts as a class-level reliability prior: compact class
+distributions yield more stable empirical prototypes, whereas dispersed
+classes carry greater prototype uncertainty. Although ``Sigma_c`` defines the
+Gaussian mathematically, the score depends only on
+``Tr(Sigma_c) = sum_d Var(z_d)``. The implementation therefore stores this
+scalar sufficient statistic and never constructs or inverts a covariance
+matrix.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -36,44 +42,26 @@ __all__ = ["ClassGaussian", "PCMAConfig", "ProbabilisticAlignmentModule"]
 
 @dataclass
 class ClassGaussian:
-    """Diagonal Gaussian manifold of a single class."""
+    """Prototype and scalar dispersion of a single class."""
 
     label: str
     mu: np.ndarray
     """Mean embedding, shape ``(D,)``."""
-    var: np.ndarray
-    """Per-dimension variance (diagonal of ``Sigma_c``), shape ``(D,)``."""
+    trace: float
+    """Mean squared distance to the prototype, ``Tr(Sigma_c)``."""
     n_samples: int
-
-    @property
-    def trace(self) -> float:
-        """``Tr(Sigma_c)``, the total variance of the class manifold."""
-        return float(np.sum(self.var))
 
 
 @dataclass
 class PCMAConfig:
     """Configuration for :class:`ProbabilisticAlignmentModule`."""
 
-    sigma_sq: float = 100.0
+    sigma_sq: float = 1.0
     """Bandwidth ``sigma^2`` of the exponential kernel."""
-    min_variance: float = 1e-6
-    """Floor applied to per-dimension variance to avoid singular manifolds."""
-    shrinkage: float = 0.0
-    """Optional shrinkage of per-class variance towards the pooled variance.
-
-    ``0.0`` uses the per-class estimate unchanged. Values in ``(0, 1]`` are
-    useful when some classes have few samples, since a diagonal variance
-    estimated from a handful of embeddings is noisy.
-    """
 
     def __post_init__(self) -> None:
         if self.sigma_sq <= 0:
             raise ValueError(f"sigma_sq must be > 0, got {self.sigma_sq}")
-        if self.min_variance <= 0:
-            raise ValueError(f"min_variance must be > 0, got {self.min_variance}")
-        if not 0.0 <= self.shrinkage <= 1.0:
-            raise ValueError(f"shrinkage must be in [0, 1], got {self.shrinkage}")
 
 
 class ProbabilisticAlignmentModule:
@@ -81,12 +69,12 @@ class ProbabilisticAlignmentModule:
 
     The module is fitted once on the annotated candidate pool (the training
     split) and then queried during exemplar selection. Fitting involves no
-    gradient updates: it only accumulates first and second moments of the
-    calibrated embeddings, so the training-free setting is preserved.
+    gradient updates: it only computes prototypes and scalar dispersions of the
+    frozen calibrated embeddings.
 
     Example
     -------
-    >>> pcma = ProbabilisticAlignmentModule(PCMAConfig(sigma_sq=100.0))
+    >>> pcma = ProbabilisticAlignmentModule(PCMAConfig(sigma_sq=1.0))
     >>> pcma.fit(features, labels)                      # doctest: +SKIP
     >>> pcma.typicality(z_e, "forest")                  # doctest: +SKIP
     0.83...
@@ -103,7 +91,7 @@ class ProbabilisticAlignmentModule:
         features: np.ndarray,
         labels: Sequence[str],
     ) -> Dict[str, ClassGaussian]:
-        """Estimate one diagonal Gaussian per class.
+        """Estimate one prototype and scalar dispersion per class.
 
         Parameters
         ----------
@@ -126,11 +114,6 @@ class ProbabilisticAlignmentModule:
 
         self._feature_dim = features.shape[1]
 
-        # Pooled variance is used both as the shrinkage target and as the
-        # fallback for classes represented by a single sample.
-        pooled_var = np.var(features, axis=0)
-        pooled_var = np.maximum(pooled_var, self.config.min_variance)
-
         by_class: Dict[str, List[int]] = {}
         for idx, label in enumerate(labels):
             by_class.setdefault(label, []).append(idx)
@@ -138,27 +121,12 @@ class ProbabilisticAlignmentModule:
         manifolds: Dict[str, ClassGaussian] = {}
         for label, indices in by_class.items():
             block = features[indices]
-            mu = np.mean(block, axis=0)
-
-            if block.shape[0] > 1:
-                var = np.var(block, axis=0)
-            else:
-                # A single observation carries no variance information; fall
-                # back to the pooled estimate rather than an arbitrary
-                # constant, so Tr(Sigma_c) stays on a comparable scale.
-                var = pooled_var.copy()
-                logger.warning(
-                    "class %r has a single candidate; using pooled variance for Sigma_c",
-                    label,
-                )
-
-            if self.config.shrinkage > 0.0:
-                lam = self.config.shrinkage
-                var = (1.0 - lam) * var + lam * pooled_var
-
-            var = np.maximum(var, self.config.min_variance)
+            mu = block.mean(axis=0)
+            centered = block - mu
+            # Equivalent to sum_d Var(z_d) with population variance (ddof=0).
+            trace = float(np.mean(np.sum(centered**2, axis=1)))
             manifolds[label] = ClassGaussian(
-                label=label, mu=mu, var=var, n_samples=block.shape[0]
+                label=label, mu=mu, trace=trace, n_samples=block.shape[0]
             )
 
         self._manifolds = manifolds

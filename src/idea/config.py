@@ -19,7 +19,8 @@ YAML schema (all fields optional; absent fields keep defaults)::
 
     experiment:
       shots: 20
-      token_budget: 4096
+      token_budget: null
+      max_new_tokens: 100
       device: cuda:0
       results_dir: ./results
 
@@ -29,9 +30,7 @@ YAML schema (all fields optional; absent fields keep defaults)::
       load_in_8bit: false
 
     pcma:
-      sigma_sq: 100.0
-      min_variance: 1.0e-6
-      shrinkage: 0.0
+      sigma_sq: 1.0
 
     sac:
       temperature: 0.07
@@ -39,14 +38,15 @@ YAML schema (all fields optional; absent fields keep defaults)::
       use_hard_negatives: true
 
     calibration:
-      w_sem: 0.7
-      w_str: 0.3
-      weight_mode: amplitude
       use_structural: true
-      standardise: true
 
     lsconv:
-      dim: 64
+      vit_dim: 1024
+      proj_dim: 128
+      num_blocks: 2
+      random_seed: 42
+      structure_temperature: 0.07
+      checkpoint_path: lsnet_t.pth
 
     selection:
       alpha: 0.4
@@ -55,6 +55,7 @@ YAML schema (all fields optional; absent fields keep defaults)::
       delta: 0.3
       omega1: 0.2
       omega2: 0.15
+      adaptive: true
 
     priors:
       hard_class_threshold: 0.5
@@ -83,7 +84,8 @@ class DatasetConfig:
 @dataclass
 class ExperimentConfig:
     shots: int = 20                 # k (number of in-context examples per query)
-    token_budget: int = 4096        # max total tokens per prompt (images + text)
+    token_budget: Optional[int] = None
+    max_new_tokens: int = 100
     device: str = "cuda:0"
     results_dir: str = "./results"
     log_every: int = 50             # log accuracy every N queries
@@ -98,9 +100,7 @@ class ModelConfig:
 
 @dataclass
 class PCMAConfig:
-    sigma_sq: float = 100.0
-    min_variance: float = 1e-6
-    shrinkage: float = 0.0
+    sigma_sq: float = 1.0
 
 
 @dataclass
@@ -112,16 +112,17 @@ class SACConfig:
 
 @dataclass
 class CalibrationConfig:
-    w_sem: float = 0.7
-    w_str: float = 0.3
-    weight_mode: str = "amplitude"  # "amplitude" or "similarity"
     use_structural: bool = True
-    standardise: bool = True
 
 
 @dataclass
 class LSConvConfig:
-    dim: int = 64                   # paper: Phi_str in R^64 (Eq. 6)
+    vit_dim: int = 1024
+    proj_dim: int = 128
+    num_blocks: int = 2
+    random_seed: int = 42
+    structure_temperature: float = 0.07
+    checkpoint_path: Optional[str] = "lsnet_t.pth"
 
 
 @dataclass
@@ -132,6 +133,7 @@ class SelectionConfig:
     delta: float = 0.3              # S_hard weight
     omega1: float = 0.2             # typicality sub-weight in S_sim
     omega2: float = 0.15            # discriminativeness sub-weight in S_sim
+    adaptive: bool = True
 
 
 @dataclass

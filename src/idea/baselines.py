@@ -6,7 +6,7 @@ Methods
 * **Cosine** -- top-k nearest neighbors by cosine similarity via FAISS.
 * **RICES** -- Retrieval-based ICL with class-balanced round-robin selection.
   See Yang et al., 2023 (https://arxiv.org/abs/2209.01511).
-* **DiverseICL** -- greedy facility-location diversity maximisation.
+* **DiverseICL** -- greedy farthest-first diversity selection.
 
 All methods share the same call signature::
 
@@ -14,7 +14,7 @@ All methods share the same call signature::
         query_embedding,
         candidates,
         k=20,
-        token_budget=4096,
+        token_budget=None,
     )
 
 where *candidates* is a list of :class:`~idea.selection.Candidate` and the
@@ -229,7 +229,7 @@ def rices_select(
     return selected
 
 
-# DiverseICL (greedy facility location)
+# DiverseICL (greedy farthest-first selection)
 
 def diverse_select(
     query_embedding: np.ndarray,
@@ -237,7 +237,7 @@ def diverse_select(
     k: int = 20,
     token_budget: Optional[int] = None,
 ) -> list:
-    """Greedy facility-location diversity maximisation (DiverseICL).
+    """Greedy farthest-first diversity selection (DiverseICL).
 
     Algorithm
     ---------
@@ -248,10 +248,9 @@ def diverse_select(
 
         e* = argmax_{e in C \\ S}  min_{s in S}  (1 - cos(e, s))
 
-    This is the greedy approximation to the facility-location objective, which
-    maximises total coverage of the embedding space. When ``S`` is empty, the
-    first candidate is chosen by cosine similarity to the query (so the
-    selection is anchored to the query rather than arbitrary).
+    When ``S`` is empty, the first candidate is chosen by cosine similarity to
+    the query. Each later demonstration maximizes its minimum cosine distance
+    to the selected set.
 
     Runtime: O(k * |C|) inner products -- acceptable for |C| <= a few thousand.
     """

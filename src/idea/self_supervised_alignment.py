@@ -1,6 +1,6 @@
 """Self-Supervised Alignment Contrast (SAC).
 
-Implements the discriminativeness score of Section 3.2 (Eq. 9-10).
+Implements the SAC contrastive score defined in Section 3.2.
 
 SAC answers a different question from PCMA. PCMA asks whether a candidate is
 *typical* of its own class. SAC asks whether a candidate is *separable* from the
@@ -12,11 +12,11 @@ Definitions
 -----------
 For a candidate ``e`` with ground-truth class ``c``:
 
-Initial contrast (Eq. 9)::
+Initial contrast::
 
     S_disc_init(e) = sim(z_e, z_c^+) - max_{j in H(c)} sim(z_e, z_j^-)
 
-Normalised contrastive alignment probability (Eq. 10)::
+Normalised contrastive alignment probability::
 
                           exp(sim(z_e, z_c^+) / tau)
     S_disc(e) = ---------------------------------------------------------
@@ -38,8 +38,7 @@ hard negative prototype is closer -- exactly the case we want to suppress.
 Note on scope
 -------------
 This module only *scores* candidates. It performs no gradient updates: the
-prototypes are means over frozen features and ``H`` is a lookup table. The
-``training-free`` property of the framework is preserved.
+prototypes are means over frozen features and ``H`` is a lookup table.
 """
 
 from __future__ import annotations
@@ -67,7 +66,7 @@ class ClassPrototypes:
     """Per-class prototype embeddings ``z_c^+``.
 
     The prototype is the mean of the calibrated embeddings of every
-    candidate-pool example belonging to that class, as stated below Eq. 9.
+    candidate-pool example belonging to that class.
     Prototypes are L2-normalised so that ``sim`` is a plain dot product.
     """
 
@@ -137,7 +136,7 @@ class ClassPrototypes:
 
 @dataclass
 class HardNegativeSet:
-    """The hard negative class sets ``H(c)`` used in Eq. 9-10.
+    """The validation-confusion hard negative class sets ``H(c)``.
 
     ``H`` is estimated from zero-shot confusion on the validation split: for
     class ``c`` we keep the classes that the frozen MLLM most often predicts when
@@ -182,29 +181,12 @@ class HardNegativeSet:
         if empty:
             logger.info(
                 "SAC: %d/%d classes had no validation confusion; "
-                "their H will fall back to nearest prototypes (%s)",
+                "S_disc is 1.0 for those classes (%s)",
                 len(empty),
                 len(classes),
                 ", ".join(empty[:5]) + ("..." if len(empty) > 5 else ""),
             )
         return cls(hard_negatives=hard, top_k=top_k)
-
-    def fill_missing_from_prototypes(self, prototypes: ClassPrototypes) -> None:
-        """Fallback for classes the model never confused on validation.
-
-        A class with perfect validation accuracy yields an empty ``H``, which
-        would make Eq. 10 degenerate to a constant 1.0. For those classes we use
-        the ``top_k`` nearest *other* prototypes in the calibrated space. This
-        keeps ``S_disc`` informative while staying a purely feature-space
-        estimate; it is a documented fallback, not part of Eq. 9-10.
-        """
-        for label, negatives in self.hard_negatives.items():
-            if negatives or label not in prototypes.prototypes:
-                continue
-            sims = prototypes.similarity_to_all(prototypes.get(label))
-            sims.pop(label, None)
-            ranked = sorted(sims.items(), key=lambda item: (-item[1], item[0]))
-            self.hard_negatives[label] = [other for other, _ in ranked[: self.top_k]]
 
     def get(self, label: str) -> List[str]:
         return self.hard_negatives.get(label, [])
@@ -233,13 +215,12 @@ class SACConfig:
 
 
 class SACScorer:
-    """Computes the discriminativeness score ``S_disc`` (Eq. 9-10).
+    """Computes the SAC discriminativeness score ``S_disc``.
 
     Example
     -------
     >>> prototypes = ClassPrototypes.fit(pool_z, pool_labels)
     >>> hard = HardNegativeSet.from_confusion(val_confusion, classes, top_k=5)
-    >>> hard.fill_missing_from_prototypes(prototypes)
     >>> scorer = SACScorer(prototypes, hard, SACConfig())
     >>> scores = scorer.score_batch(candidate_z, candidate_labels)
     """
@@ -255,10 +236,10 @@ class SACScorer:
         self.config = config or SACConfig()
 
     def initial_contrast(self, embedding: np.ndarray, label: str) -> float:
-        """Eq. 9: ``sim(z_e, z_c^+) - max_j sim(z_e, z_j^-)``.
+        """Return ``sim(z_e, z_c^+) - max_j sim(z_e, z_j^-)``.
 
         Kept as a separate method because it is the interpretable form (a signed
-        margin), whereas Eq. 10 is the bounded form actually used in scoring.
+        margin), whereas the normalized form is used in scoring.
         """
         vector = _l2_normalise(embedding)[0]
         positive = float(np.dot(vector, self.prototypes.get(label)))
@@ -273,7 +254,7 @@ class SACScorer:
         return positive - hardest
 
     def score(self, embedding: np.ndarray, label: str) -> float:
-        """Eq. 10: normalised contrastive alignment probability in (0, 1)."""
+        """Return the normalized contrastive alignment probability in (0, 1]."""
         vector = _l2_normalise(embedding)[0]
         tau = self.config.temperature
 
@@ -281,7 +262,7 @@ class SACScorer:
         negatives = self._negative_labels(label)
 
         # Subtract the max logit before exponentiating: mathematically identical
-        # to Eq. 10 but avoids overflow, which matters because tau is small
+        # to the definition but avoids overflow, which matters because tau is small
         # (sim/tau reaches ~14 at tau=0.07).
         logits = [positive / tau]
         logits.extend(

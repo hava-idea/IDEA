@@ -2,9 +2,8 @@
 
 This module owns the two priors used by the selection engine:
 
-* ``C_hard`` -- the set of failure-prone classes, used by the hardness score
-  ``S_hard`` (Eq. 14);
-* ``H``      -- the per-class hard negative sets, used by SAC (Eq. 9-10).
+* ``C_hard`` -- the set of failure-prone classes used by ``S_hard``;
+* ``H``      -- the per-class hard negative sets used by SAC.
 
 Both are estimated from **zero-shot inference on the validation split**, exactly
 as stated in Section 4.1 of the paper:
@@ -54,9 +53,8 @@ class ClassDifficulty:
         error rate.
     difficulty_score:
         ``error_rate + 0.5 * confusion_complexity``. A continuous difficulty
-        measure retained for diagnostics and for the optional soft-weighted
-        hardness mode. Note that Eq. 14 in the paper uses the *binary* indicator
-        ``I(y_e in C_hard)``, which remains the default.
+        measure retained for diagnostics only; it is not used by the paper's
+        binary ``S_hard`` score.
     confused_with:
         Counter of predicted labels for the misclassified samples of this class.
     """
@@ -90,7 +88,7 @@ class Priors:
     n_samples: int = 0
 
     def is_hard(self, label: str) -> bool:
-        """Indicator used by Eq. 14."""
+        """Binary indicator used by the paper's ``S_hard`` score."""
         return label in set(self.hard_classes)
 
     def difficulty_score(self, label: str) -> float:
@@ -234,10 +232,6 @@ def estimate_priors(
     totals: Counter = Counter()
     corrects: Counter = Counter()
     for truth, predicted in zip(true_labels, predictions):
-        if predicted is None:
-            # Unparseable response: excluded from the denominator so that a
-            # generation/parsing failure is not mistaken for a hard class.
-            continue
         totals[truth] += 1
         if predicted == truth:
             corrects[truth] += 1
@@ -284,10 +278,9 @@ def estimate_priors(
 
     evaluated = sum(totals.values())
     logger.info(
-        "priors estimated on %s: %d/%d samples parsed, |C_hard|=%d/%d (acc < %.2f)",
+        "priors estimated on %s: %d samples, |C_hard|=%d/%d (acc < %.2f)",
         source_split,
         evaluated,
-        len(true_labels),
         len(hard_classes),
         len(classes),
         hard_class_threshold,

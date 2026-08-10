@@ -32,7 +32,9 @@ classification format and the label is extracted from its first line.
 from __future__ import annotations
 
 import abc
+import hashlib
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -45,6 +47,20 @@ SEMANTIC_DIM = 4096
 
 #: Visual tokens per 448×448 tile after pixel-shuffle (32×32 -> 0.5 -> 16×16).
 VISUAL_TOKENS_PER_IMAGE = 256
+PATCH_TOKENS_PER_IMAGE = 1024
+PATCH_TOKEN_DIM = 1024
+
+
+@dataclass(frozen=True)
+class VisualFeatures:
+    """Both branches produced by one frozen InternVL visual forward pass."""
+
+    patch_tokens: np.ndarray
+    """Pre-projector ViT tokens, shape ``(B, 1024, 1024)``."""
+    visual_tokens: np.ndarray
+    """Post-pixel-shuffle/projector tokens, shape ``(B, 256, 4096)``."""
+    semantic: np.ndarray
+    """Mean-pooled visual tokens, shape ``(B, 4096)``."""
 
 
 class MLLMBackend(abc.ABC):
@@ -56,6 +72,11 @@ class MLLMBackend(abc.ABC):
     """
 
     @abc.abstractmethod
+    def extract_visual_features(
+        self, image_paths: Sequence[str]
+    ) -> VisualFeatures:
+        """Extract patch and semantic streams with one visual forward per image."""
+
     def extract_features(self, image_paths: Sequence[str]) -> np.ndarray:
         """Extract semantic embeddings for a batch of images.
 
@@ -70,13 +91,14 @@ class MLLMBackend(abc.ABC):
         ``(N, SEMANTIC_DIM)`` float32 array -- ``Phi_sem`` for each image, NOT
         yet L2-normalised (normalisation happens inside the calibrator).
         """
+        return self.extract_visual_features(image_paths).semantic
 
     @abc.abstractmethod
     def generate(
         self,
         prompt: str,
         image_paths: Sequence[str],
-        max_new_tokens: int = 64,
+        max_new_tokens: int = 100,
     ) -> str:
         """Run the MLLM on a multi-image prompt.
 
@@ -192,25 +214,71 @@ class InternVLBackend(MLLMBackend):
         img = Image.open(image_path).convert("RGB")
         return transform(img).unsqueeze(0).to(self._device, dtype=self._dtype)
 
-    def extract_features(self, image_paths: Sequence[str]) -> np.ndarray:
+    def extract_visual_features(
+        self, image_paths: Sequence[str]
+    ) -> VisualFeatures:
         import torch
 
-        vectors = []
+        patch_batches = []
+        visual_batches = []
+        semantic_batches = []
         with torch.no_grad():
             for path in image_paths:
                 pixel_values = self._preprocess(path)
-                # extract_feature returns (1, 256, 4096) -- 256 visual tokens.
-                vit_features = self._model.extract_feature(pixel_values)
-                pooled = vit_features.mean(dim=1)  # (1, 4096)
-                vectors.append(pooled.float().cpu().numpy())
+                output_hidden_states = getattr(self._model, "select_layer", -1) != -1
+                vision_output = self._model.vision_model(
+                    pixel_values=pixel_values,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=True,
+                )
+                if output_hidden_states:
+                    vit_tokens = vision_output.hidden_states[self._model.select_layer]
+                else:
+                    vit_tokens = vision_output.last_hidden_state
 
-        return np.concatenate(vectors, axis=0)  # (N, 4096)
+                # InternVL's first vision token is CLS. The remaining 32x32
+                # patch tokens feed both branches below.
+                patch_tokens = vit_tokens[:, 1:, :]
+                batch, count, dim = patch_tokens.shape
+                if (count, dim) != (PATCH_TOKENS_PER_IMAGE, PATCH_TOKEN_DIM):
+                    raise ValueError(
+                        "InternVL checkpoint is incompatible with the paper path: "
+                        f"expected patch tokens (*, 1024, 1024), got {tuple(patch_tokens.shape)}"
+                    )
+
+                side = int(count**0.5)
+                shuffled = patch_tokens.reshape(batch, side, side, dim)
+                shuffled = self._model.pixel_shuffle(
+                    shuffled, scale_factor=self._model.downsample_ratio
+                )
+                shuffled = shuffled.reshape(batch, -1, shuffled.shape[-1])
+                visual_tokens = self._model.mlp1(shuffled)
+                if tuple(visual_tokens.shape[1:]) != (
+                    VISUAL_TOKENS_PER_IMAGE,
+                    SEMANTIC_DIM,
+                ):
+                    raise ValueError(
+                        "InternVL checkpoint is incompatible with the paper path: "
+                        f"expected visual tokens (*, 256, 4096), got {tuple(visual_tokens.shape)}"
+                    )
+
+                patch_batches.append(patch_tokens.float().cpu().numpy())
+                visual_batches.append(visual_tokens.float().cpu().numpy())
+                semantic_batches.append(
+                    visual_tokens.mean(dim=1).float().cpu().numpy()
+                )
+
+        return VisualFeatures(
+            patch_tokens=np.concatenate(patch_batches, axis=0),
+            visual_tokens=np.concatenate(visual_batches, axis=0),
+            semantic=np.concatenate(semantic_batches, axis=0),
+        )
 
     def generate(
         self,
         prompt: str,
         image_paths: Sequence[str],
-        max_new_tokens: int = 64,
+        max_new_tokens: int = 100,
     ) -> str:
         import torch
         from PIL import Image
@@ -255,7 +323,7 @@ class MockBackend(MLLMBackend):
         classes: Optional[Sequence[str]] = None,
     ) -> None:
         self._dim = dim
-        self._rng = np.random.default_rng(seed)
+        self._seed = seed
         self._cache: Dict[str, np.ndarray] = {}
         self._classes = list(classes) if classes is not None else []
         logger.info(
@@ -269,24 +337,47 @@ class MockBackend(MLLMBackend):
         if path not in self._cache:
             # Seed derived from the path string so the result is reproducible
             # across calls even when paths arrive in different order.
-            h = abs(hash(path)) % (2**31)
+            digest = hashlib.sha256(f"{self._seed}:{path}".encode("utf-8")).digest()
+            h = int.from_bytes(digest[:8], "little")
             rng = np.random.default_rng(h)
             vec = rng.standard_normal(self._dim).astype(np.float32)
             self._cache[path] = vec
         return self._cache[path]
 
-    def extract_features(self, image_paths: Sequence[str]) -> np.ndarray:
-        return np.stack([self._get_or_make(p) for p in image_paths], axis=0)
+    def extract_visual_features(
+        self, image_paths: Sequence[str]
+    ) -> VisualFeatures:
+        semantics = np.stack([self._get_or_make(p) for p in image_paths], axis=0)
+        patches = []
+        for path in image_paths:
+            digest = hashlib.sha256(
+                f"{self._seed}:patch:{path}".encode("utf-8")
+            ).digest()
+            rng = np.random.default_rng(int.from_bytes(digest[:8], "little"))
+            patches.append(
+                rng.standard_normal(
+                    (PATCH_TOKENS_PER_IMAGE, PATCH_TOKEN_DIM), dtype=np.float32
+                )
+            )
+        patch_tokens = np.stack(patches, axis=0)
+        # The mock does not emulate InternVL's learned projector. It preserves
+        # the public shapes and deterministic behavior needed by pipeline tests.
+        visual_tokens = np.repeat(
+            semantics[:, None, :], VISUAL_TOKENS_PER_IMAGE, axis=1
+        )
+        return VisualFeatures(patch_tokens, visual_tokens, semantics)
 
     def generate(
         self,
         prompt: str,
         image_paths: Sequence[str],
-        max_new_tokens: int = 64,
+        max_new_tokens: int = 100,
     ) -> str:
         if not self._classes:
             return "unknown"
-        idx = abs(hash(image_paths[-1] if image_paths else prompt)) % len(self._classes)
+        key = image_paths[-1] if image_paths else prompt
+        digest = hashlib.sha256(f"{self._seed}:{key}".encode("utf-8")).digest()
+        idx = int.from_bytes(digest[:8], "little") % len(self._classes)
         return self._classes[idx]
 
     @property
